@@ -63,6 +63,7 @@ from kiro_crew.autonudge import (
 from kiro_crew.autonudge import enabled as autonudge_enabled
 from kiro_crew.autonudge import (
     is_channel_key,
+    is_scheduled_message,
     is_structured_monitor_loop,
     runtime_budget_exceeded,
     terminal_notification_delivery_matches,
@@ -155,6 +156,7 @@ from kiro_crew.dashboard.state import (
     SUBAGENT_BATCH_COMPLETION_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
     DashboardState,
+    append_and_surface,
 )
 from kiro_crew.dashboard.token_auth import MAX_SESSION_TTL_SECS, generate_token
 from kiro_crew.dashboard.turn_dispatch import bounded_chat_turn, spawn_guarded_turn
@@ -6759,7 +6761,13 @@ class GatewayOrchestrator:
                 loop.slot_key,
                 loop.id,
             )
-        if wake_message is None:
+        scheduled = wake_message is None and is_scheduled_message(loop)
+        if scheduled:
+            # A scheduled composer message is the user's deferred turn, not goal
+            # protocol. Preserve its exact text and skip the work-ledger/nudge
+            # wrapper; unattended provenance is still enforced at `_run_chat`.
+            tagged = loop.message
+        elif wake_message is None:
             msg = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
             tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg}"
         else:
@@ -6789,7 +6797,7 @@ class GatewayOrchestrator:
         # is truthy too and its blank row is worse than the verbose one, so both
         # fall through to ``tagged``.
         banner = loop.banner.strip() if isinstance(loop.banner, str) else ""
-        if banner and wake_message is None:
+        if banner and wake_message is None and not scheduled:
             # Credential redaction lives at the banner's single owner — the
             # authorized write paths (incl. /goal via ``normalize_banner``) and
             # ``_load`` for a hand-edited store — so ``loop.banner`` is already
@@ -6829,24 +6837,27 @@ class GatewayOrchestrator:
         if not await self._dashboard_mode_admits(loop, slot):
             await self._audit_fire_refused(loop, slot)
             return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
-        # Show nudge as a distinct "nudge" role message in the slot history.
-        # The structured meta lets the dashboard render a compact cycle chip
-        # instead of echoing the whole instruction payload as a chat bubble.
-        # The tag stays in ``content`` because that is what the model reads,
-        # and the body is deliberately NOT duplicated into meta — the client
-        # derives it from content, so a multi-KB payload is stored and
-        # broadcast once rather than twice. ``visible`` rather than ``tagged``
-        # in the appended row: identical unless the loop opted into a ``banner``,
-        # in which case this transcript row is the only thing shortened while the
-        # full ``tagged`` prompt still reaches ``_run_chat``.
-        nudge_meta: dict[str, Any] = {
-            "nudge": {
-                "cycle": loop.cycle_count + 1,
-                "loop_id": loop.id,
+        # Show the delivered input in the slot history. Goal loops keep their
+        # distinct nudge role and compact cycle metadata; a scheduled composer
+        # message uses the ordinary user role plus scheduled-message metadata so
+        # the transcript reflects what the user deferred rather than inventing an
+        # auto-nudge cycle. The body is deliberately not duplicated into meta.
+        if scheduled:
+            delivery_meta: dict[str, Any] = {
+                "scheduled_message": {
+                    "at": loop.scheduled_at,
+                    "loop_id": loop.id,
+                }
             }
-        }
+        else:
+            delivery_meta = {
+                "nudge": {
+                    "cycle": loop.cycle_count + 1,
+                    "loop_id": loop.id,
+                }
+            }
         if wake_message is not None and loop.monitor is not None:
-            nudge_meta["monitor"] = {
+            delivery_meta["monitor"] = {
                 "id": loop.id,
                 "fingerprint": loop.monitor.last_wake_fingerprint,
                 "classification": (
@@ -6863,12 +6874,22 @@ class GatewayOrchestrator:
         assert dashboard_state is not None and turn_slot is not None
 
         def _append_nudge() -> None:
-            turn_slot.append(
-                "nudge",
-                visible,
-                "msg msg-nudge",
-                meta=nudge_meta,
-            )
+            if scheduled:
+                # Unlike a composer submission, this deferred user row has no
+                # optimistic client bubble. Surface it explicitly through the
+                # one identity-carrying helper so open chats see the prompt now
+                # and the ordinary slot save keeps the same row in history.
+                append_and_surface(
+                    dashboard_state,
+                    turn_slot,
+                    "user",
+                    visible,
+                    "msg msg-u",
+                    meta=delivery_meta,
+                    broadcast_user=True,
+                )
+            else:
+                turn_slot.append("nudge", visible, "msg msg-nudge", meta=delivery_meta)
 
         if completion_hook is None:
             _append_nudge()
@@ -6985,6 +7006,18 @@ class GatewayOrchestrator:
                 _run_dashboard_turn(),
             )
         task = spawn_guarded_turn(dashboard_state, turn_slot, turn_coro)
+        if scheduled:
+            # The task itself is the authoritative lifetime of this one-shot.
+            # Most agent turns also reach chat_runner's generic completion hook,
+            # but fast slash-command paths can finish without that path settling
+            # the loop. Re-notifying is idempotent; omitting this leaves a 1/1
+            # record that still occupies the session until manually stopped.
+            def _retire_scheduled_message(_task: asyncio.Task[Any]) -> None:
+                service = self.autonudge_svc
+                if service is not None:
+                    service.notify_turn_complete(loop.slot_key)
+
+            task.add_done_callback(_retire_scheduled_message)
         # Mirror dashboard /api/chat/send path so slot.running == True and sidebar
         # shows the "turn active" three-dots indicator immediately.
         slot.task = task

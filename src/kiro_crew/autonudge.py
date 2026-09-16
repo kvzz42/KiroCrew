@@ -108,6 +108,7 @@ _NUDGES_FILE = "autonudge.json"
 _STORE_VERSION = 1
 _MIN_IDLE_SECS = 15
 _MAX_IDLE_SECS = 86400  # 24h
+MAX_SCHEDULE_AHEAD_SECS = 30 * 86400
 # Re-arm delay after a skipped/failed fire so a busy slot or a transient fire
 # error can't silently orphan the loop. The delay escalates exponentially per
 # consecutive failure (base << streak) up to _REARM_MAX_BACKOFF_SECS, and is
@@ -640,6 +641,25 @@ class NudgeLoop:
     # written before the field existed decodes to False -- every such loop
     # was armed under the old rule, which admitted no self-arm.
     self_armed: bool = False
+    # Absolute wall-clock instant for a composer-authored one-shot message.
+    # Zero keeps every existing goal/monitor record on its historical path. A
+    # positive value is both the wire discriminator and the requested schedule;
+    # ``next_due_ts`` remains the live/restart deadline and equals this value
+    # until delivery. Appended so an older gateway filters it as an unknown field
+    # and safely degrades the row to a one-cycle goal loop rather than failing to
+    # load the store.
+    scheduled_at: float = 0.0
+
+
+def is_scheduled_message(loop: NudgeLoop) -> bool:
+    """Whether *loop* is a composer-authored one-shot scheduled message."""
+    value = getattr(loop, "scheduled_at", 0.0)
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and value > 0
+    )
 
 
 def is_structured_monitor_loop(loop: NudgeLoop) -> bool:
@@ -1073,6 +1093,32 @@ class AutoNudgeService:
                 loop.next_due_ts, due_repaired = _repair_number(
                     loop.next_due_ts, lo=0.0, fallback=0.0
                 )
+                scheduled_at, scheduled_repaired = _repair_number(
+                    loop.scheduled_at, lo=0.0, fallback=0.0
+                )
+                loop.scheduled_at = scheduled_at
+                if scheduled_at > 0 and loop.monitor is not None:
+                    # The two modes are mutually exclusive at every writer. A
+                    # hand-edited row carrying both keeps the richer typed monitor
+                    # and drops the unknown one-shot marker rather than routing a
+                    # controller wake through composer-message semantics.
+                    loop.scheduled_at = 0.0
+                    scheduled_at = 0.0
+                    scheduled_repaired = True
+                elif scheduled_at > 0:
+                    # The requested instant is the authority until the single
+                    # delivery is charged. Repair derivative fields rather than
+                    # allowing a hand-edited interval/cap to change one-shot
+                    # semantics after restart.
+                    if loop.max_cycles != 1:
+                        loop.max_cycles = 1
+                        scheduled_repaired = True
+                    if loop.gate:
+                        loop.gate = False
+                        scheduled_repaired = True
+                    if loop.cycle_count == 0 and loop.next_due_ts != scheduled_at:
+                        loop.next_due_ts = scheduled_at
+                        due_repaired = True
                 idle_num, idle_repaired = _repair_number(
                     loop.idle_secs,
                     lo=float(_MIN_IDLE_SECS),
@@ -1089,7 +1135,7 @@ class AutoNudgeService:
                     # its atomically-persisted inspection mirror.
                     loop.monitor.next_probe_at = loop.next_due_ts
                     self._store_dirty = True
-                if due_repaired or idle_repaired:
+                if due_repaired or scheduled_repaired or idle_repaired:
                     self._store_dirty = True
                 notification_stopped_at, notification_time_repaired = _repair_number(
                     loop.terminal_notification_stopped_at,
@@ -1454,6 +1500,7 @@ class AutoNudgeService:
         stop_sentinel_path: str = "",
         max_runtime_secs: int = 0,
         banner: str = "",
+        scheduled_at: float = 0.0,
         admission_check: Callable[[], bool] | None = None,
         # UNGATED by default, and the default lives at the ARMING SURFACES instead.
         # The evidence for gating is about monitor_start -- a babysit loop whose work
@@ -1489,6 +1536,7 @@ class AutoNudgeService:
                 stop_sentinel_path=stop_sentinel_path,
                 max_runtime_secs=max_runtime_secs,
                 banner=banner,
+                scheduled_at=scheduled_at,
                 admission_check=admission_check,
                 gate=gate,
                 replace_existing=replace_existing,
@@ -1812,6 +1860,7 @@ class AutoNudgeService:
         stop_sentinel_path: str,
         max_runtime_secs: int = 0,
         banner: str = "",
+        scheduled_at: float = 0.0,
         admission_check: Callable[[], bool] | None = None,
         gate: bool = False,
         replace_existing: bool = True,
@@ -1829,6 +1878,7 @@ class AutoNudgeService:
                 stop_sentinel_path=stop_sentinel_path,
                 max_runtime_secs=max_runtime_secs,
                 banner=banner,
+                scheduled_at=scheduled_at,
                 admission_check=admission_check,
                 gate=gate,
                 replace_existing=replace_existing,
@@ -1848,6 +1898,7 @@ class AutoNudgeService:
         stop_sentinel_path: str,
         max_runtime_secs: int = 0,
         banner: str = "",
+        scheduled_at: float = 0.0,
         admission_check: Callable[[], bool] | None = None,
         gate: bool = False,
         replace_existing: bool = True,
@@ -1857,6 +1908,13 @@ class AutoNudgeService:
         creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
     ) -> NudgeLoop:
         idle_secs = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
+        if isinstance(scheduled_at, bool):
+            raise ValueError("scheduled_at must be a finite epoch-seconds number")
+        scheduled_at = float(scheduled_at)
+        if not math.isfinite(scheduled_at) or scheduled_at < 0:
+            raise ValueError("scheduled_at must be a finite epoch-seconds number")
+        if scheduled_at > 0 and is_channel_key(slot_key):
+            raise ValueError("scheduled messages currently require a dashboard session")
         async with self._lock:
             if admission_check is not None and not admission_check():
                 raise NudgeAdmissionRefused("session changed before nudge arm committed")
@@ -1930,15 +1988,15 @@ class AutoNudgeService:
                 slot_key=slot_key,
                 message=message,
                 idle_secs=idle_secs,
-                max_cycles=max(0, int(max_cycles)),
+                max_cycles=1 if scheduled_at > 0 else max(0, int(max_cycles)),
                 created_ts=now,
                 stop_sentinel_path=stop_sentinel_path,
                 max_runtime_secs=max(0, int(max_runtime_secs)),
-                # Anchor the first deadline at arm time (set BEFORE the
-                # snapshot below so it persists): the countdown starts the
-                # moment the loop is armed, and user turns from here on only
-                # defer delivery, never restart it.
-                next_due_ts=now + idle_secs,
+                # A scheduled composer message owns an absolute wall-clock
+                # instant. Ordinary loops retain the historical interval-derived
+                # first deadline.
+                next_due_ts=scheduled_at if scheduled_at > 0 else now + idle_secs,
+                scheduled_at=scheduled_at,
                 # The SUBJECT is decided HERE, from the instruction the caller
                 # already wrote -- no target, kind or enable flag is ever passed.
                 # WHETHER to look for one is the ``gate`` argument above, which the
@@ -1966,9 +2024,11 @@ class AutoNudgeService:
                 # subject; keying that only on the wording of the instruction made a
                 # cadence contract depend on prose.
                 monitor=(
-                    infer_monitor(message, now, creation_surface=creation_surface) if gate else None
+                    infer_monitor(message, now, creation_surface=creation_surface)
+                    if gate and scheduled_at <= 0
+                    else None
                 ),
-                gate=gate,
+                gate=gate if scheduled_at <= 0 else False,
                 banner=banner,
                 self_armed=self_armed,
             )
@@ -2030,6 +2090,7 @@ class AutoNudgeService:
         max_runtime_secs: int | None = None,
         stopped_reason: str | None = None,
         banner: str | None = None,
+        scheduled_at: float | None = None,
     ) -> NudgeLoop | None:
         # CANCELLATION SAFETY: same contract as add(). The mutate+persist runs
         # as a SHIELDED, supervised task so a caller cancelled mid-write cannot
@@ -2046,6 +2107,7 @@ class AutoNudgeService:
                 max_runtime_secs=max_runtime_secs,
                 stopped_reason=stopped_reason,
                 banner=banner,
+                scheduled_at=scheduled_at,
             )
         )
         self._inflight_adds.add(inner)
@@ -2121,6 +2183,7 @@ class AutoNudgeService:
         max_runtime_secs: int | None = None,
         stopped_reason: str | None = None,
         banner: str | None = None,
+        scheduled_at: float | None = None,
     ) -> NudgeLoop | None:
         lock = await self._acquire_mutation_lock(loop_id)
         if lock is None:
@@ -2135,6 +2198,7 @@ class AutoNudgeService:
                 max_runtime_secs=max_runtime_secs,
                 stopped_reason=stopped_reason,
                 banner=banner,
+                scheduled_at=scheduled_at,
             )
         finally:
             lock.release()
@@ -2150,6 +2214,7 @@ class AutoNudgeService:
         max_runtime_secs: int | None = None,
         stopped_reason: str | None = None,
         banner: str | None = None,
+        scheduled_at: float | None = None,
     ) -> NudgeLoop | None:
         async with self._lock:
             loop = self._loops.get(loop_id)
@@ -2160,6 +2225,18 @@ class AutoNudgeService:
                 # touching even one shared scheduling field so a non-HTTP
                 # caller cannot bypass structured policy.
                 return loop
+            if is_scheduled_message(loop) and (
+                loop.cycle_count > 0 or loop.id in self._firing or not loop.active
+            ):
+                raise ValueError("scheduled message is already firing or completed")
+            if scheduled_at is not None:
+                if isinstance(scheduled_at, bool):
+                    raise ValueError("scheduled_at must be a future epoch-seconds number")
+                scheduled_at = float(scheduled_at)
+                if not math.isfinite(scheduled_at) or scheduled_at <= time.time():
+                    raise ValueError("scheduled_at must be a future epoch-seconds number")
+                if not is_scheduled_message(loop):
+                    raise ValueError("scheduled_at can only update a scheduled message")
             # Keep typed nested values intact. ``asdict`` recursively converts
             # MonitorState to a plain dict, which is not a valid rollback value.
             previous = {item.name: getattr(loop, item.name) for item in fields(loop)}
@@ -2253,6 +2330,15 @@ class AutoNudgeService:
                 # ``idle_secs`` below, quieting a running loop must not restart
                 # its countdown. "" clears it back to the verbose default.
                 loop.banner = banner
+            if scheduled_at is not None:
+                # A scheduled message has not fired yet (validated above), so
+                # both persisted deadline fields move together. The timer is
+                # cancelled and re-armed only after the replacement snapshot
+                # commits below.
+                loop.scheduled_at = scheduled_at
+                loop.next_due_ts = scheduled_at
+                loop.max_cycles = 1
+                loop.gate = False
             interval_changed = False
             if idle_secs is not None:
                 new_idle = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
@@ -3800,6 +3886,14 @@ class AutoNudgeService:
                 MONITOR_STATE_VERSION,
             )
             return
+        # A successful scheduled dispatch keeps owning the session until its turn
+        # completes. The completion hook reaches here with the one cycle charged;
+        # run the ordinary cap gate immediately so it removes the one-shot row.
+        # The same branch cleans a delivered row recovered after a crash, without
+        # handing it a second fire.
+        if is_scheduled_message(loop) and loop.cycle_count >= 1:
+            self._arm_timer(loop, delay=0.0)
+            return
         now = time.time()
         if loop.next_due_ts <= 0:
             loop.next_due_ts = now + loop.idle_secs
@@ -3809,6 +3903,12 @@ class AutoNudgeService:
         remaining = loop.next_due_ts - now
         if remaining <= 0:
             delay = float(_OVERDUE_REARM_SECS)
+        elif is_scheduled_message(loop):
+            # An absolute schedule may be farther away than the recurring loop's
+            # 24-hour interval ceiling. Sleeping to the deadline is safe because
+            # user input cancels this task and restart recovery rebuilds it from
+            # the persisted instant.
+            delay = remaining
         else:
             delay = min(remaining, float(loop.idle_secs))
         self._arm_timer(loop, delay=delay)
@@ -4457,6 +4557,14 @@ class AutoNudgeService:
             return
         if shutdown_event.is_set():
             return
+        # ``asyncio.sleep`` follows a monotonic clock while a scheduled message
+        # names wall-clock time. If the system clock moves backward during the
+        # sleep, waking is not proof the requested instant arrived; re-arm for the
+        # new remaining duration instead of sending early.
+        if is_scheduled_message(loop) and loop.cycle_count == 0 and time.time() < loop.scheduled_at:
+            loop.next_due_ts = loop.scheduled_at
+            self._arm_from_deadline(loop)
+            return
         if is_structured_monitor_loop(loop):
             assert loop.monitor is not None
             waiting_for_terminal_completion = self._waits_for_terminal_completion(loop)
@@ -4496,6 +4604,15 @@ class AutoNudgeService:
             return
         # Cycle cap reached?
         if loop.max_cycles and loop.cycle_count >= loop.max_cycles:
+            if is_scheduled_message(loop):
+                # A delivered scheduled message is complete, not a stopped goal
+                # that needs inspection. Removing it frees the session's single
+                # automation slot for another schedule or Set a Goal. This path is
+                # reached from turn completion and after restart, so the one cycle
+                # stays exclusive through the turn and cannot be replayed.
+                logger.info("AutoNudge: scheduled message %s delivered — removing", loop.id)
+                await self.remove(loop.id)
+                return
             logger.info("AutoNudge: loop %s reached max_cycles — deactivating", loop.id)
             await self.update(loop.id, active=False, stopped_reason="cycle_cap")
             # Signal the cap. Reaching max_cycles is NOT a successful finish —

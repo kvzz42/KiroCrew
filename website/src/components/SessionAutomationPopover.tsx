@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react'
-import { Activity, Goal, Radar, RotateCw, Square, Trash2, X } from 'lucide-react'
+import { Activity, Clock, Goal, Radar, RotateCw, Square, Trash2, X } from 'lucide-react'
 import { useIsFetching, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, ApiError, type MonitorWrite } from '../api/client'
 import {
@@ -20,6 +20,7 @@ import AutoNudgePopover, { type AutoNudgeLoop } from './AutoNudgePopover'
 import { i18nT } from '../i18n/t'
 import MonitorRadar from './MonitorRadar'
 import ErrorNotice from './ErrorNotice'
+import { fireTimeLocal, toFireTime } from './ScheduleLaterPopover'
 
 interface Props {
   slotKey: string
@@ -121,6 +122,7 @@ function legacyWire(loop: LegacyGoalLoop): AutoNudgeLoop {
     last_fire_ts: loop.lastFireAt,
     next_due_ts: loop.nextDueAt ?? 0,
     ...(loop.stopSentinelPath !== undefined ? { stop_sentinel_path: loop.stopSentinelPath } : {}),
+    scheduled_at: loop.scheduledAt,
   }
 }
 
@@ -184,6 +186,7 @@ export default function SessionAutomationPopover({
   /* Separate from confirmStop: the two act on different states and one erases.
      A shared flag would let a stop confirmation land on the clear. */
   const [confirmClear, setConfirmClear] = useState(false)
+  const [scheduledError, setScheduledError] = useState('')
   const id = useId()
   const queryClient = useQueryClient()
   const snapshotFetching = useIsFetching({ queryKey: ['session-automation', slotKey], exact: true }) > 0
@@ -192,8 +195,17 @@ export default function SessionAutomationPopover({
   const slotKeyRef = useRef(slotKey)
   slotKeyRef.current = slotKey
   const sessionModeUnsupported = sessionMode === 'crew' || sessionMode === 'member'
-  const legacyView = automation?.kind === 'legacy_goal_loop'
-    || (!monitor && boundedModeSlot !== slotKey)
+  const legacyLoop = automation?.kind === 'legacy_goal_loop' ? automation : null
+  const scheduledLoop = legacyLoop && (legacyLoop.scheduledAt ?? 0) > 0 ? legacyLoop : null
+  const [scheduledMessage, setScheduledMessage] = useState('')
+  const [scheduledLocal, setScheduledLocal] = useState('')
+  useEffect(() => {
+    if (!open || !scheduledLoop) return
+    setScheduledMessage(scheduledLoop.message)
+    setScheduledLocal(fireTimeLocal(scheduledLoop.scheduledAt as number))
+  }, [open, scheduledLoop])
+  const legacyView = (!!legacyLoop && !scheduledLoop)
+    || (!monitor && !scheduledLoop && boundedModeSlot !== slotKey)
 
   useEffect(() => {
     if (!open) return
@@ -208,6 +220,7 @@ export default function SessionAutomationPopover({
     setBoundedModeSlot(automation?.kind === 'structured_monitor' ? slotKey : null)
     setConfirmStop(false)
     setConfirmClear(false)
+    setScheduledError('')
   }, [open, automation?.id, automation?.kind, slotKey])
 
   /* A primed confirmation belongs to the record the reader was LOOKING at. This
@@ -282,23 +295,89 @@ export default function SessionAutomationPopover({
     },
   })
 
+  const scheduledCancel = useMutation({
+    mutationFn: async (loopId: string) => {
+      const response = await fetch(`/api/autonudge/${encodeURIComponent(loopId)}?intent=stop`, {
+        method: 'DELETE',
+      })
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as Record<string, unknown>
+        throw new Error(typeof payload.error === 'string'
+          ? payload.error
+          : i18nT('components.sessionAutomationPopover.request_failed'))
+      }
+    },
+    onSuccess: () => {
+      setScheduledError('')
+      onChange(null)
+      queryClient.invalidateQueries({ queryKey: ['session-automation', slotKey] })
+      onOpenChange(false)
+    },
+    onError: failure => {
+      setScheduledError(failure instanceof Error
+        ? failure.message
+        : i18nT('components.sessionAutomationPopover.request_failed'))
+    },
+  })
+
+  const scheduledUpdate = useMutation({
+    mutationFn: async (loop: LegacyGoalLoop) => {
+      const at = toFireTime(scheduledLocal)
+      if (!scheduledMessage.trim() || at === null) {
+        throw new Error(i18nT('components.jobForm.pick_a_time_in_the_future'))
+      }
+      const body: Record<string, string | number> = { message: scheduledMessage.trim() }
+      if (scheduledLocal !== fireTimeLocal(loop.scheduledAt as number)) body.at = at
+      const response = await fetch(`/api/autonudge/${encodeURIComponent(loop.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const payload = await response.json().catch(() => ({})) as Record<string, unknown>
+      if (!response.ok) {
+        throw new Error(typeof payload.error === 'string'
+          ? payload.error
+          : i18nT('components.sessionAutomationPopover.request_failed'))
+      }
+      const next = normalizeAutomationRecord(payload.loop)
+      if (next?.kind !== 'legacy_goal_loop' || !(next.scheduledAt && next.scheduledAt > 0)) {
+        throw new Error(i18nT('components.sessionAutomationPopover.request_failed'))
+      }
+      return next
+    },
+    onSuccess: next => {
+      setScheduledError('')
+      onChange(next)
+      queryClient.invalidateQueries({ queryKey: ['session-automation', slotKey] })
+      onOpenChange(false)
+    },
+    onError: failure => {
+      setScheduledError(failure instanceof Error
+        ? failure.message
+        : i18nT('components.sessionAutomationPopover.request_failed'))
+    },
+  })
+
   const terminal = monitor?.terminal ?? null
   const status = monitor ? deriveAutomationStatus(monitor) : 'arm_pending'
   const statusLabel = i18nT(MONITOR_STATUS_KEYS[status])
-  const legacyLoop = automation?.kind === 'legacy_goal_loop' ? automation : null
   const legacyCycle = legacyLoop?.maxCycles
     ? `${legacyLoop.cycleCount}/${legacyLoop.maxCycles}`
     : String(legacyLoop?.cycleCount ?? 0)
-  const triggerLabel = legacyLoop?.active
-    ? i18nT(
-      interrupted
-        ? 'components.autoNudgePopover.goal_interrupted_cycle'
-        : 'components.autoNudgePopover.goal_active_cycle',
-      { cycle: legacyCycle },
-    )
-    : monitor
-      ? i18nT('components.sessionAutomationPopover.monitor_status', { status: statusLabel })
-      : i18nT('components.autoNudgePopover.set_a_goal')
+  const triggerLabel = scheduledLoop
+    ? i18nT('components.chatInput.one_message_scheduled', {
+      when: fmtDateTimeNumeric(scheduledLoop.scheduledAt as number),
+    })
+    : legacyLoop?.active
+      ? i18nT(
+        interrupted
+          ? 'components.autoNudgePopover.goal_interrupted_cycle'
+          : 'components.autoNudgePopover.goal_active_cycle',
+        { cycle: legacyCycle },
+      )
+      : monitor
+        ? i18nT('components.sessionAutomationPopover.monitor_status', { status: statusLabel })
+        : i18nT('components.autoNudgePopover.set_a_goal')
   const busy = mutation.isPending && mutation.variables?.editorKey === editorKey
   const draft = editor.draft
   const hasDirtyFields = Object.keys(editor.dirty).length > 0
@@ -456,19 +535,101 @@ export default function SessionAutomationPopover({
               fixes in the label -- and there is no probing to depict. Once
               anything IS armed the radar is accurate and carries the
               action-running pulse. */}
-          {monitor || legacyLoop ? (
+          {scheduledLoop ? (
+            <Clock className="h-4 w-4 lucide-inline shrink-0" aria-hidden />
+          ) : monitor || legacyLoop ? (
             <MonitorRadar actionRunning={status === 'action_running'} />
           ) : (
             <Goal className="lucide-inline shrink-0" aria-hidden />
           )}
           {monitor ? (
             <span className="text-[11px] font-mono">{fmtNumber(monitor.usage.probes)}</span>
-          ) : legacyLoop?.cycleCount ? (
+          ) : legacyLoop?.cycleCount && !scheduledLoop ? (
             <span className="text-[11px] font-mono">{legacyCycle}</span>
           ) : null}
         </IconButton>
       )}
-      content={legacyView ? undefined : (
+      content={scheduledLoop ? (
+        <PopoverContent
+          side="top"
+          align="start"
+          className="w-[min(calc(100vw-1rem),26.25rem)] p-4 text-[12px]"
+        >
+          <div className="flex items-start justify-between gap-3 mb-3">
+            <div className="min-w-0">
+              <h2 className="flex items-center gap-2 text-sm font-semibold text-text">
+                <Clock className="h-4 w-4 lucide-inline text-accent shrink-0" aria-hidden />
+                {i18nT('components.chatInput.scheduled_message')}
+              </h2>
+              <p className="mt-1 text-[11px] text-muted">
+                {i18nT('components.chatInput.one_message_scheduled', {
+                  when: fmtDateTimeNumeric(scheduledLoop.scheduledAt as number),
+                })}
+              </p>
+            </div>
+            <IconButton
+              aria-label={i18nT('components.sessionAutomationPopover.close')}
+              onClick={() => requestOpenChange(false)}
+            >
+              <X className="lucide-inline" aria-hidden />
+            </IconButton>
+          </div>
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <label className="block text-[11px] font-medium text-muted" htmlFor={`${id}-scheduled-message`}>
+                {i18nT('components.jobForm.message')}
+              </label>
+              <textarea
+                id={`${id}-scheduled-message`}
+                aria-label={i18nT('components.jobForm.message')}
+                className="w-full min-h-[84px] resize-y rounded-lg border border-border bg-bg px-3 py-2 text-[12px] text-text outline-none focus-ring"
+                value={scheduledMessage}
+                onChange={event => setScheduledMessage(event.target.value)}
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="block text-[11px] font-medium text-muted" htmlFor={`${id}-scheduled-at`}>
+                {i18nT('components.jobForm.run_once')}
+              </label>
+              <Input
+                id={`${id}-scheduled-at`}
+                type="datetime-local"
+                aria-label={i18nT('components.jobForm.run_once')}
+                value={scheduledLocal}
+                onChange={event => setScheduledLocal(event.target.value)}
+              />
+            </div>
+          </div>
+          {scheduledError ? (
+            <div className="mt-3">
+              {/* No hand-off: the scheduled-message edits are still unsaved. */}
+              <ErrorNotice
+                variant="inline"
+                message={scheduledError}
+                onDismiss={() => setScheduledError('')}
+              />
+            </div>
+          ) : null}
+          <div className="mt-3 flex justify-end gap-2">
+            <Btn
+              danger
+              onClick={() => scheduledCancel.mutate(scheduledLoop.id)}
+              disabled={scheduledCancel.isPending || scheduledUpdate.isPending || scheduledLoop.cycleCount > 0}
+            >
+              {i18nT('pages.schedulePage.cancel')}
+            </Btn>
+            <Btn
+              primary
+              onClick={() => scheduledUpdate.mutate(scheduledLoop)}
+              disabled={scheduledCancel.isPending || scheduledUpdate.isPending || !scheduledMessage.trim() || toFireTime(scheduledLocal) === null}
+            >
+              {scheduledUpdate.isPending
+                ? i18nT('components.jobForm.saving')
+                : i18nT('components.jobForm.save')}
+            </Btn>
+          </div>
+        </PopoverContent>
+      ) : legacyView ? undefined : (
         <PopoverContent
           side="top"
           align="start"

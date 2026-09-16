@@ -96,6 +96,8 @@ export interface LegacyGoalLoop {
   active: boolean
   lastFireAt: number
   nextDueAt?: number
+  /** Requested absolute time for a one-shot composer message; absent for goals. */
+  scheduledAt?: number
   maxRuntimeSecs?: number
   stoppedReason: string
   /** The kill-switch file the server substitutes for `{{STOP_FILE}}` at fire
@@ -300,6 +302,7 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
   if (!id || !slotKey) return null
 
   if (!owns(loop, 'monitor')) {
+    const scheduledAt = finite(loop.scheduled_at)
     return {
       kind: 'legacy_goal_loop',
       id,
@@ -311,6 +314,7 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
       active: !removed && loop.active === true,
       lastFireAt: finite(loop.last_fire_ts),
       nextDueAt: finite(loop.next_due_ts),
+      scheduledAt: scheduledAt > 0 ? scheduledAt : undefined,
       maxRuntimeSecs: count(loop.max_runtime_secs),
       stoppedReason: text(loop.stopped_reason),
       ...(typeof loop.stop_sentinel_path === 'string'
