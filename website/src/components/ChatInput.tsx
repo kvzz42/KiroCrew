@@ -1,6 +1,6 @@
 import { Component, useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId, memo, lazy, Suspense } from 'react'
 import { markComposerResize } from '../utils/composerResize'
-import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, MicOff, Keyboard, Square, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, FileDiff, PenLine, ChevronsDownUp, ChevronsUpDown, MoreHorizontal } from 'lucide-react'
+import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Clock, Crop, Bot, Mic, MicOff, Keyboard, Square, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, FileDiff, PenLine, ChevronsDownUp, ChevronsUpDown, MoreHorizontal } from 'lucide-react'
 import SketchDialog from './SketchDialog'
 import AppIcon from './AppIcon'
 import CopyBranchButton from './CopyBranchButton'
@@ -32,7 +32,8 @@ import { pickToolLabel } from '../utils/toolLabel'
 import { deriveToolCallTitle } from '../utils/toolCallTitle'
 import { toApiDecision } from '../utils/approvalDecision'
 import TrustDropdown from './TrustDropdown'
-import type { AutomationRecord } from '../monitoring/automation'
+import { normalizeAutomationRecord, type AutomationRecord } from '../monitoring/automation'
+import ScheduleLaterPopover from './ScheduleLaterPopover'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { isTouchDevice } from '../utils/isTouchDevice'
 import { useIsTouchDevice } from '../hooks/useIsTouchDevice'
@@ -142,7 +143,7 @@ import { useMeasuredHeight } from '../hooks/useMeasuredHeight'
 
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from './ui/dropdown-menu'
 import { i18nT } from '../i18n/t'
-import { fmtDateFields, fmtPercent } from '../i18n/format'
+import { fmtDateFields, fmtDateTimeNumeric, fmtPercent } from '../i18n/format'
 import SessionRefStrip from './SessionRefStrip'
 import type { SessionRef } from '../utils/sessionRefs'
 import { activeElementIsEditable, isEditableTarget } from '../utils/editableTarget'
@@ -1395,6 +1396,8 @@ function ChatInput({
   const fileInputId = useId()
   // "+" drop-up menu (upload file / image + browse toggle).
   const [plusOpen, setPlusOpen] = useState(false)
+  const [scheduleOpen, setScheduleOpen] = useState(false)
+  const [scheduleError, setScheduleError] = useState('')
   const [sketchOpen, setSketchOpen] = useState(false)
   const [ctxPopoverOpen, setCtxPopoverOpen] = useState(false)
   // Per-session auto-compact threshold (slider in the context popover). The
@@ -1510,6 +1513,7 @@ function ChatInput({
   }, [ctxPopoverOpen])
   const plusWrapRef = useRef<HTMLDivElement>(null)
   const plusBtnRef = useRef<HTMLButtonElement>(null)
+  const mobileMoreBtnRef = useRef<HTMLButtonElement>(null)
   const plusMenuRef = useRef<HTMLDivElement>(null)
   const [plusRect, setPlusRect] = useState<DOMRect | null>(null)
   useEffect(() => {
@@ -1524,13 +1528,28 @@ function ChatInput({
     return () => document.removeEventListener('mousedown', h)
   }, [plusOpen])
   const measurePlus = useCallback(() => {
-    if (plusBtnRef.current) setPlusRect(plusBtnRef.current.getBoundingClientRect())
+    const anchor = plusBtnRef.current ?? mobileMoreBtnRef.current
+    if (anchor) setPlusRect(anchor.getBoundingClientRect())
   }, [])
-  // Keeps the portaled "+" menu anchored while the trigger moves under it --
-  // notably when the mobile keyboard closes (visualViewport-only signal).
-  useAnchorRemeasure(plusOpen, measurePlus)
+  // Keeps the portaled "+" menu and its Send later picker anchored while the
+  // trigger moves under them -- notably when the mobile keyboard closes.
+  useAnchorRemeasure(plusOpen || scheduleOpen, measurePlus)
+  useEffect(() => {
+    setScheduleOpen(false)
+    setScheduleError('')
+  }, [slotId])
   const togglePlus = () => {
-    if (!plusOpen) measurePlus()
+    if (!plusOpen) {
+      measurePlus()
+      // The + menu owns this composer interaction. Close sigil-driven pickers
+      // first so their higher portal layer cannot cover the menu or its
+      // Schedule Later child while preserving the draft text itself.
+      setSlashMenuOpen(false)
+      setFilePickerOpen(false)
+      setFileQuery('')
+      setSkillPickerOpen(false)
+      setSkillQuery('')
+    }
     setPlusOpen(o => !o)
   }
   // Client-side `accept` is a UX hint only (input-validation guidance: server enforces type via
@@ -1672,6 +1691,101 @@ function ChatInput({
   // The deadline binds HERE too, not only in the menu: react-query dedupes on that
   // shared key, so the menu opening onto this fetch never runs its own queryFn.
   const queryClient = useQueryClient()
+  const scheduledAutomation = automation?.kind === 'legacy_goal_loop'
+    && automation.active
+    && (automation.scheduledAt ?? 0) > 0
+    && automation.cycleCount === 0
+    ? automation
+    : null
+  const restoreScheduledDraft = useCallback((message: string) => {
+    const current = value.trim()
+    if (!current) {
+      onChange(message)
+    } else if (current !== message) {
+      const paragraphBreak = String.fromCharCode(10, 10)
+      onChange(value.trimEnd() + paragraphBreak + message)
+    }
+  }, [value, onChange])
+  const sendLaterDisabledReason = !value.trim()
+    ? i18nT('components.jobForm.message_is_required')
+    : !connected
+        ? i18nT('components.chatInput.gateway_offline_message_will_not_send')
+        : automation
+          ? automation.kind === 'legacy_goal_loop'
+            ? i18nT('components.autoNudgePopover.goal_active_cycle', {
+              cycle: automation.cycleCount,
+            })
+            : `${i18nT('components.sessionAutomationPopover.title')} — ${i18nT('components.sessionAutomationPopover.stop_monitor')}`
+          : sessionMode === 'crew' || sessionMode === 'member'
+            ? i18nT('components.sessionAutomationPopover.session_mode_unavailable')
+            : memoryMode === 'incognito'
+              ? i18nT('components.welcomeView.incognito_active_switch_to_persistent')
+              : memoryMode === 'temporary'
+                ? i18nT('components.welcomeView.temporary_active_switch_to_persistent')
+                : !slotId || !onAutomationChange || !automationCreationReady
+                  ? i18nT('components.sessionAutomationPopover.snapshot_failed')
+                  : ''
+  const scheduleSendMutation = useMutation({
+    mutationFn: async ({ text, atSecs }: { text: string; atSecs: number }) => {
+      const response = await fetch('/api/autonudge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slot_key: slotId, message: text, at: atSecs }),
+      })
+      const payload = await response.json().catch(() => ({})) as Record<string, unknown>
+      if (!response.ok) {
+        throw new Error(typeof payload.error === 'string'
+          ? payload.error
+          : i18nT('components.sessionAutomationPopover.request_failed'))
+      }
+      const next = normalizeAutomationRecord(payload.loop)
+      if (next?.kind !== 'legacy_goal_loop' || !(next.scheduledAt && next.scheduledAt > 0)) {
+        throw new Error(i18nT('components.sessionAutomationPopover.request_failed'))
+      }
+      return { next, text }
+    },
+    onSuccess: ({ next, text }) => {
+      setScheduleError('')
+      if (value.trim() === text) onChange('')
+      onAutomationChange?.(next)
+    },
+    onError: error => {
+      // No hand-off: the unsent composer draft is deliberately retained so the
+      // user can retry the schedule or send it now.
+      setScheduleError(agentSwitchFailureMessage(error))
+    },
+  })
+  const cancelScheduledMutation = useMutation({
+    mutationFn: async ({ id }: { id: string; message: string }) => {
+      const response = await fetch(`/api/autonudge/${encodeURIComponent(id)}?intent=stop`, {
+        method: 'DELETE',
+      })
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as Record<string, unknown>
+        throw new Error(typeof payload.error === 'string'
+          ? payload.error
+          : i18nT('components.sessionAutomationPopover.request_failed'))
+      }
+    },
+    onSuccess: (_result, request) => {
+      setScheduleError('')
+      restoreScheduledDraft(request.message)
+      onAutomationChange?.(null)
+    },
+    onError: error => setScheduleError(agentSwitchFailureMessage(error)),
+  })
+  const scheduleComposer = useCallback((atSecs: number) => {
+    const text = value.trim()
+    if (!text || disabled || !slotId || !onAutomationChange) return
+    setScheduleOpen(false)
+    scheduleSendMutation.mutate({ text, atSecs })
+  }, [value, disabled, slotId, onAutomationChange, scheduleSendMutation])
+  const openScheduleLater = useCallback(() => {
+    const anchor = plusBtnRef.current ?? mobileMoreBtnRef.current
+    if (anchor) setPlusRect(anchor.getBoundingClientRect())
+    setScheduleError('')
+    setScheduleOpen(true)
+  }, [])
   // Per-session auto-compact threshold: fetched lazily on popover open (the
   // slots frame stays untouched), cached under the standard query layer. The
   // slider writes optimistically into the cache per step and the debounced
@@ -3775,6 +3889,57 @@ function ChatInput({
         )}
       </AnimatePresence>
 
+      {scheduledAutomation && (
+        <div className="px-4 mb-1">
+          <div
+            role="status"
+            data-testid="scheduled-message-banner"
+            className="flex items-center gap-2 rounded-lg border border-accent-subtle bg-accent-subtle/40 px-2.5 py-1.5 text-[12px] text-muted"
+          >
+            <Btn
+              onClick={() => onAutomationClick?.(true)}
+              className="!min-h-0 !border-none !bg-transparent !p-0 min-w-0 flex-1 justify-start text-left"
+              data-testid="scheduled-message-edit"
+            >
+              <Clock className="h-3.5 w-3.5 shrink-0 lucide-inline" aria-hidden />
+              <span className="min-w-0 flex-1 truncate" title={scheduledAutomation.message}>
+                {i18nT('components.chatInput.scheduled_message')}
+                {' · '}
+                {fmtDateTimeNumeric(scheduledAutomation.scheduledAt as number)}
+              </span>
+            </Btn>
+            <Btn
+              onClick={() => cancelScheduledMutation.mutate({
+                id: scheduledAutomation.id,
+                message: scheduledAutomation.message,
+              })}
+              disabled={cancelScheduledMutation.isPending}
+              data-testid="scheduled-message-cancel"
+            >
+              {i18nT('components.sessionAutomationPopover.cancel')}
+            </Btn>
+          </div>
+        </div>
+      )}
+      {scheduleOpen && plusRect && (
+        <ScheduleLaterPopover
+          anchorRect={plusRect}
+          onSchedule={scheduleComposer}
+          onClose={() => setScheduleOpen(false)}
+          scheduling={scheduleSendMutation.isPending}
+        />
+      )}
+      {scheduleError && (
+        <div className="px-4 mb-1">
+          {/* No hand-off: the unsent composer draft is retained for retry/send-now. */}
+          <ErrorNotice
+            variant="inline"
+            testId="schedule-error"
+            message={scheduleError}
+            onDismiss={() => setScheduleError('')}
+          />
+        </div>
+      )}
       {optimizeError && (
         <div className="px-4 mb-1">
           {/* No hand-off: the composer draft below (the prompt that was restored) is unsaved. */}
@@ -4202,6 +4367,34 @@ function ChatInput({
                     <div className="mt-2 flex flex-col gap-0.5">
                       <button
                         type="button"
+                        onClick={() => { setPlusOpen(false); openScheduleLater() }}
+                        disabled={!!sendLaterDisabledReason || scheduleSendMutation.isPending}
+                        title={scheduleSendMutation.isPending
+                          ? i18nT('components.jobForm.saving')
+                          : sendLaterDisabledReason || i18nT('components.chatInput.send_later')}
+                        className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                        data-testid="plus-menu-send-later"
+                      >
+                        <Clock className="h-3.5 w-3.5 shrink-0 text-muted lucide-inline" aria-hidden />
+                        <div className="min-w-0">
+                          <div className="text-[12px] font-medium text-text">
+                            {i18nT('components.chatInput.send_later')}
+                          </div>
+                          {(scheduleSendMutation.isPending || sendLaterDisabledReason) ? (
+                            <div className="text-[11px] text-muted leading-snug">
+                              {scheduleSendMutation.isPending
+                                ? i18nT('components.jobForm.saving')
+                                : sendLaterDisabledReason}
+                            </div>
+                          ) : (
+                            <div className="text-[11px] text-muted leading-snug">
+                              {i18nT('components.chatInput.scheduled_message')}
+                            </div>
+                          )}
+                        </div>
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => { setPlusOpen(false); setSketchOpen(true) }}
                         title={i18nT('components.chatInput.sketch')}
                         className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
@@ -4328,6 +4521,7 @@ function ChatInput({
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <button
+                    ref={mobileMoreBtnRef}
                     type="button"
                     data-testid="composer-more-trigger"
                     className="w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all bg-transparent border-none shrink-0 text-muted hover:text-text hover:bg-bg-hover data-[state=open]:text-text data-[state=open]:bg-bg-hover"
@@ -4338,6 +4532,33 @@ function ChatInput({
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent side="top" align="start" className="w-[260px] p-2">
+                  <DropdownMenuItem
+                    disabled={!!sendLaterDisabledReason || scheduleSendMutation.isPending}
+                    onSelect={() => { setTimeout(openScheduleLater, 0) }}
+                    title={scheduleSendMutation.isPending
+                      ? i18nT('components.jobForm.saving')
+                      : sendLaterDisabledReason || i18nT('components.chatInput.send_later')}
+                    data-testid="mobile-menu-send-later"
+                    className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg cursor-pointer text-left"
+                  >
+                    <Clock className="h-3.5 w-4 shrink-0 text-muted lucide-inline" aria-hidden />
+                    <div className="min-w-0">
+                      <div className="text-[12px] font-medium text-text">
+                        {i18nT('components.chatInput.send_later')}
+                      </div>
+                      {(scheduleSendMutation.isPending || sendLaterDisabledReason) ? (
+                        <div className="text-[11px] text-muted leading-snug">
+                          {scheduleSendMutation.isPending
+                            ? i18nT('components.jobForm.saving')
+                            : sendLaterDisabledReason}
+                        </div>
+                      ) : (
+                        <div className="text-[11px] text-muted leading-snug">
+                          {i18nT('components.chatInput.scheduled_message')}
+                        </div>
+                      )}
+                    </div>
+                  </DropdownMenuItem>
                   {onUploadFiles && (
                     /* `disabled={uploading}` restores a guard the pencil carried and
                        this row lost when Sketch moved in here. Sketch attaches
@@ -4395,6 +4616,7 @@ function ChatInput({
                     open={automationOpen || false}
                     onOpenChange={v => onAutomationClick(v)}
                     onChange={onAutomationChange || (() => {})}
+                    onRestoreScheduledMessage={restoreScheduledDraft}
                     creationReady={automationCreationReady}
                     snapshotFailed={automationSnapshotFailed}
                     sessionMode={sessionMode}

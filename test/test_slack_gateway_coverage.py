@@ -2080,12 +2080,17 @@ class TestFireDashboardNudgeDispatch:
         ds.get_slot.return_value = slot
         orch.dashboard_state = ds
 
-        # _run_chat's return value is handed straight to the (patched)
-        # spawn_guarded_turn, so a plain sentinel avoids creating a coroutine
-        # nothing will ever await.
+        # Keep the wrapper construction real, but close it at the patched task
+        # boundary because this unit test only verifies dispatch bookkeeping.
+        ds.run_background_turn.side_effect = lambda _slot, coro: coro
         task = MagicMock()
+
+        def discard_turn(_state, _slot, coro):
+            coro.close()
+            return task
+
         monkeypatch.setattr("kiro_crew.dashboard.chat._run_chat", MagicMock(return_value="CORO"))
-        monkeypatch.setattr(gw, "spawn_guarded_turn", MagicMock(return_value=task))
+        monkeypatch.setattr(gw, "spawn_guarded_turn", discard_turn)
 
         loop = _loop("chat-1", cycle_count=1)
         assert await orch._fire_dashboard_nudge(loop) is True
@@ -2099,6 +2104,82 @@ class TestFireDashboardNudgeDispatch:
         assert slot.task is task
         assert orch._session_tasks["chat-1"] is task
         ds.push_slots_update.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_scheduled_message_is_an_exact_user_turn(self, monkeypatch):
+        """Reuse the nudge dispatcher without leaking nudge protocol into the prompt."""
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        slot = MagicMock()
+        slot.running = False
+        slot._in_stage_execution = False
+        slot._has_reader = False
+        slot.key = "chat-1"
+        ds.get_slot.return_value = slot
+        ds.run_background_turn.side_effect = lambda _slot, coro: coro
+        orch.dashboard_state = ds
+        orch.autonudge_svc = MagicMock()
+
+        spawned: list[asyncio.Task] = []
+
+        def spawn(_state, _slot, coro):
+            task = asyncio.create_task(coro)
+            spawned.append(task)
+            return task
+
+        run_chat = AsyncMock(return_value=None)
+        monkeypatch.setattr("kiro_crew.dashboard.chat._run_chat", run_chat)
+        monkeypatch.setattr(gw, "spawn_guarded_turn", spawn)
+        loop = _loop(
+            "chat-1",
+            message="follow up with the release owner",
+            max_cycles=1,
+            scheduled_at=2_000.0,
+        )
+
+        assert await orch._fire_dashboard_nudge(loop) is True
+        await asyncio.gather(*spawned)
+        await asyncio.sleep(0)
+
+        assert slot.append.call_args.args == (
+            "user",
+            "follow up with the release owner",
+            "msg msg-u",
+        )
+        assert slot.append.call_args.kwargs["broadcast_user"] is True
+        assert slot.append.call_args.kwargs["meta"] == {
+            "scheduled_message": {"at": 2_000.0, "loop_id": "loop-1"}
+        }
+        assert run_chat.call_args.args[2] == "follow up with the release owner"
+        assert run_chat.call_args.kwargs["_directive_user_origin"] is False
+        # Completion belongs to chat_runner's landed-turn verdict, not task exit.
+        orch.autonudge_svc.notify_turn_complete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_scheduled_message_does_not_compose_a_nudge_body(self, monkeypatch):
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        slot = MagicMock(running=False, _in_stage_execution=False, key="chat-1")
+        ds.get_slot.return_value = slot
+        ds.run_background_turn.side_effect = lambda _slot, coro: coro
+        orch.dashboard_state = ds
+        monkeypatch.setattr("kiro_crew.dashboard.chat._run_chat", MagicMock(return_value="CORO"))
+
+        def discard_turn(_state, _slot, coro):
+            coro.close()
+            return MagicMock()
+
+        monkeypatch.setattr(gw, "spawn_guarded_turn", discard_turn)
+        compose = AsyncMock(side_effect=AssertionError("scheduled text reached nudge composer"))
+        monkeypatch.setattr(gw, "compose_nudge_body", compose)
+
+        assert (
+            await orch._fire_dashboard_nudge(
+                _loop("chat-1", message="exact text", max_cycles=1, scheduled_at=2_000.0)
+            )
+            is True
+        )
+        compose.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_structured_delivery_distinguishes_busy_and_unavailable(self, monkeypatch):
@@ -2143,8 +2224,15 @@ class TestFireDashboardNudgeDispatch:
             return restored
 
         monkeypatch.setattr(gw, "rehydrate_slot_from_history_async", _rehydrate)
+        ds.run_background_turn.side_effect = lambda _slot, coro: coro
+        task = MagicMock()
+
+        def discard_turn(_state, _slot, coro):
+            coro.close()
+            return task
+
         monkeypatch.setattr("kiro_crew.dashboard.chat._run_chat", MagicMock(return_value="CORO"))
-        monkeypatch.setattr(gw, "spawn_guarded_turn", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(gw, "spawn_guarded_turn", discard_turn)
 
         assert await orch._fire_dashboard_nudge(_loop("chat-9")) is True
         orch.autonudge_svc.remove.assert_not_called()

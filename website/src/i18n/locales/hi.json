@@ -5984,6 +5984,8 @@
       "session_control_needs_attention": "ध्यान देने की ज़रूरत",
       "session_control_ready": "तैयार",
       "session_control_chip_label": "{{label}} — {{detail}}",
+      "send_later": "बाद में भेजें…",
+      "scheduled_message": "शेड्यूल किया गया संदेश",
       "agent_inherited_default": "यह सत्र डिफ़ॉल्ट एजेंट ({{name}}) का अनुसरण करता है। इसका अपना कोई एजेंट नहीं है, इसलिए डिफ़ॉल्ट बदलने पर यह भी बदल जाता है। पिन करने के लिए क्लिक करें।",
       "model_inherited_default": "यह सत्र डिफ़ॉल्ट मॉडल ({{name}}) पर चलता है। इसका अपना कोई मॉडल नहीं है, इसलिए डिफ़ॉल्ट बदलने पर यह भी बदल जाता है। एक पिन करने के लिए क्लिक करें।"
     },
@@ -6576,6 +6578,8 @@
       "channel_id_optional": "चैनल ID (वैकल्पिक)",
       "command": "कमांड",
       "cron_expression": "Cron एक्सप्रेशन",
+      "run_once": "एक बार चलाएँ",
+      "pick_a_time_in_the_future": "भविष्य का समय चुनें",
       "days": "दिन",
       "default": "डिफ़ॉल्ट",
       "enter_a_valid_5_field_cron_expression": "मान्य 5-फ़ील्ड cron एक्सप्रेशन डालें",

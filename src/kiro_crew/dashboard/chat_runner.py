@@ -15286,7 +15286,7 @@ async def _run_chat(
 
             _autonudge = _autonudge_get()
             if _autonudge is not None:
-                _autonudge.notify_turn_complete(slot.key)
+                _autonudge.notify_turn_complete(slot.key, turn_completed=_turn_landed)
         except Exception:
             logger.debug("autonudge.notify_turn_complete failed", exc_info=True)
         # Clean up mirror stream on any exit path.

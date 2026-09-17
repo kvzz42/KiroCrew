@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import time
 from dataclasses import asdict, fields
 from typing import Any
 
 from aiohttp import web
 
-from kiro_crew.autonudge import binding_key_for
+from kiro_crew.autonudge import MAX_SCHEDULE_AHEAD_SECS, binding_key_for
 from kiro_crew.autonudge import get_instance as _autonudge_get
-from kiro_crew.autonudge import is_structured_monitor_loop
+from kiro_crew.autonudge import is_scheduled_message, is_structured_monitor_loop
 
 # The security chokepoint lives in the transport-agnostic module (see its
 # docstring); re-exported here so existing importers keep working. This file
@@ -117,6 +119,7 @@ def _redact_monitor_value(value: Any) -> Any:
 
 def _serialize(loop: Any) -> dict[str, Any]:
     payload = asdict(loop)
+    payload.pop("scheduled_completed", None)
     if loop.monitor is None:
         # Legacy clients predate structured monitors and require their exact shape.
         payload.pop("monitor", None)
@@ -155,6 +158,8 @@ def _serialize_monitor(loop: Any) -> dict[str, Any]:
 #:   has no banner to describe.
 #: * ``stop_sentinel_path`` -- a filesystem path, and the structured branch of
 #:   ``_timer`` returns before the sentinel is ever tested.
+#: * ``scheduled_at`` -- a structured monitor is recurring/controller-owned,
+#:   never a composer-authored one-shot, so zero would be a fabricated schedule.
 #:
 #: UNMAINTAINED on the structured path -- but two of these three have a TRUTHFUL
 #: equivalent in the monitor's own state, so they are MAPPED (below) rather than
@@ -176,6 +181,8 @@ _MONITOR_WITHHELD_LEGACY_FIELDS = frozenset(
         "message",
         "banner",
         "stop_sentinel_path",
+        "scheduled_at",
+        "scheduled_completed",
         "max_cycles",
         "cycle_count",
         "last_fire_ts",
@@ -822,11 +829,69 @@ async def api_monitor_restart(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "monitor": _serialize_monitor(restarted)})
 
 
+def _scheduled_message_at(
+    body: dict[str, Any], *, required: bool
+) -> tuple[float | None, web.Response | None]:
+    """Parse one whole-second future ``at`` value within the 30-day horizon."""
+    if "at" not in body:
+        if required:
+            return None, web.json_response(
+                {"error": "at is required", "code": "scheduled_at_required"}, status=400
+            )
+        return None, None
+    raw_at = body.get("at")
+    if raw_at is None or isinstance(raw_at, bool):
+        return None, web.json_response(
+            {"error": "at must be epoch seconds", "code": "invalid_scheduled_at"}, status=400
+        )
+    try:
+        scheduled_at = float(raw_at)
+    except (TypeError, ValueError, OverflowError):
+        return None, web.json_response(
+            {"error": "at must be epoch seconds", "code": "invalid_scheduled_at"}, status=400
+        )
+    if not math.isfinite(scheduled_at):
+        return None, web.json_response(
+            {"error": "at must be finite epoch seconds", "code": "invalid_scheduled_at"},
+            status=400,
+        )
+    if not scheduled_at.is_integer():
+        return None, web.json_response(
+            {
+                "error": "at must identify a whole second",
+                "code": "scheduled_at_not_whole_second",
+            },
+            status=400,
+        )
+    now = time.time()
+    if scheduled_at <= now:
+        return None, web.json_response(
+            {
+                "error": "scheduled time must be in the future",
+                "code": "scheduled_at_not_future",
+            },
+            status=400,
+        )
+    if scheduled_at > now + MAX_SCHEDULE_AHEAD_SECS:
+        return None, web.json_response(
+            {
+                "error": "scheduled time must be within 30 days",
+                "code": "scheduled_at_too_far",
+            },
+            status=400,
+        )
+    return scheduled_at, None
+
+
 async def api_autonudge_start(request: web.Request) -> web.Response:
     """POST /api/autonudge — start or replace a loop on a slot.
 
     Body: { slot_key, message, idle_secs?, max_cycles?, max_runtime_secs?,
-            stop_sentinel_path?, gate?, banner? }
+            stop_sentinel_path?, gate?, banner?, at? }
+
+    ``at`` switches this create into a dashboard-only one-shot scheduled
+    message: an integer epoch-seconds instant within 30 days. It uses the same
+    session automation record and create-only conflict as Set a Goal.
 
     ``gate`` defaults to FALSE here: this route arms whatever the goal popover was
     given, and only ``monitor_start`` has the evidence to gate by default. Pass
@@ -850,6 +915,10 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    scheduled_at, scheduled_at_error = _scheduled_message_at(body, required=False)
+    if scheduled_at_error is not None:
+        return scheduled_at_error
+    scheduled_at = scheduled_at or 0.0
     # idle_secs/max_cycles/max_runtime_secs come straight from the request
     # body: int() raises ValueError on "abc", TypeError on null/list, and
     # OverflowError on float("inf") (1e309 is legal JSON in aiohttp's parser),
@@ -891,6 +960,11 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
             {"error": "gate must be a boolean", "code": "not_a_boolean"}, status=400
         )
     gate = False if raw_gate is None else raw_gate
+    if scheduled_at > 0:
+        # Scheduling is a one-shot delivery mode, never a prompt-derived monitor.
+        # The service enforces the same invariant for direct callers.
+        max_cycles = 1
+        gate = False
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
         state=state,
@@ -908,6 +982,7 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
         caller=request.remote or "",
         gate=gate,
         replace_existing=False,
+        scheduled_at=scheduled_at,
     )
     if error is not None:
         return web.json_response({"error": error, "code": "autonudge_not_armed"}, status=status)
@@ -948,6 +1023,35 @@ async def api_autonudge_update(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    scheduled_at = None
+    if existing is not None and is_scheduled_message(existing):
+        if existing.cycle_count > 0 or not existing.active:
+            return web.json_response(
+                {
+                    "error": "scheduled message is already firing or completed",
+                    "code": "scheduled_message_in_flight",
+                },
+                status=409,
+            )
+        unsupported = sorted(set(body) - {"message", "at"})
+        if unsupported:
+            return web.json_response(
+                {
+                    "error": "scheduled messages can update only message and at",
+                    "code": "scheduled_message_fields_invalid",
+                },
+                status=400,
+            )
+        if "message" in body and (
+            not isinstance(body["message"], str) or not body["message"].strip()
+        ):
+            return web.json_response(
+                {"error": "message is required", "code": "scheduled_message_empty"},
+                status=400,
+            )
+        scheduled_at, scheduled_at_error = _scheduled_message_at(body, required=False)
+        if scheduled_at_error is not None:
+            return scheduled_at_error
     loop, error, status = await authorize_and_update_nudge(
         svc=svc,
         loop_id=loop_id,
@@ -957,6 +1061,7 @@ async def api_autonudge_update(request: web.Request) -> web.Response:
         active=body.get("active"),
         max_runtime_secs=body.get("max_runtime_secs"),
         banner=body.get("banner"),
+        scheduled_at=scheduled_at,
         source="dashboard",
         caller=request.remote or "",
     )

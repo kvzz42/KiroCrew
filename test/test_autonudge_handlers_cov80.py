@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1235,6 +1236,81 @@ async def test_start_surfaces_the_authorizer_refusal(monkeypatch: pytest.MonkeyP
     }
 
 
+@pytest.mark.asyncio
+async def test_start_schedules_one_exact_future_fire(monkeypatch: pytest.MonkeyPatch) -> None:
+    _svc(monkeypatch, _FakeSvc())
+    authorize = AsyncMock(return_value=(_loop("scheduled"), None, 200))
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+    monkeypatch.setattr(h.time, "time", lambda: 1_000.0)
+
+    response = await h.api_autonudge_start(
+        _mk(
+            "POST",
+            "/api/autonudge",
+            body={"slot_key": "chat-1-111", "message": "follow up", "at": 1_900},
+        )
+    )
+
+    assert response.status == 200
+    kwargs = authorize.await_args.kwargs
+    assert kwargs["scheduled_at"] == 1_900.0
+    assert kwargs["max_cycles"] == 1
+    assert kwargs["gate"] is False
+
+
+@pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        (True, "invalid_scheduled_at"),
+        (1_000, "scheduled_at_not_future"),
+        (1_000.5, "scheduled_at_not_whole_second"),
+        (float("inf"), "invalid_scheduled_at"),
+        (1_000 + 30 * 86400 + 1, "scheduled_at_too_far"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_start_rejects_invalid_scheduled_time(
+    monkeypatch: pytest.MonkeyPatch, value: object, code: str
+) -> None:
+    _svc(monkeypatch, _FakeSvc())
+    monkeypatch.setattr(h.time, "time", lambda: 1_000.0)
+    response = await h.api_autonudge_start(
+        _mk(
+            "POST",
+            "/api/autonudge",
+            body={"slot_key": "chat-1-111", "message": "follow up", "at": value},
+        )
+    )
+    assert response.status == 400
+    assert _body(response)["code"] == code
+
+
+@pytest.mark.asyncio
+async def test_start_without_at_keeps_goal_loop_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
+    _svc(monkeypatch, _FakeSvc())
+    authorize = AsyncMock(return_value=(_loop("goal"), None, 200))
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+
+    await h.api_autonudge_start(
+        _mk(
+            "POST",
+            "/api/autonudge",
+            body={
+                "slot_key": "chat-1-111",
+                "message": "keep working",
+                "idle_secs": 120,
+                "max_cycles": 4,
+                "gate": True,
+            },
+        )
+    )
+
+    kwargs = authorize.await_args.kwargs
+    assert kwargs["scheduled_at"] == 0.0
+    assert kwargs["max_cycles"] == 4
+    assert kwargs["gate"] is True
+
+
 # --- PATCH /api/autonudge/{loop_id} ------------------------------------------
 
 
@@ -1254,6 +1330,59 @@ async def test_update_400_on_undecodable_body(monkeypatch: pytest.MonkeyPatch) -
     response = await h.api_autonudge_update(request)
     assert response.status == 400
     assert _body(response) == {"error": "invalid JSON"}
+
+
+@pytest.mark.asyncio
+async def test_update_forwards_a_pending_scheduled_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _loop("scheduled")
+    loop.scheduled_at = float(int(time.time()) + 600)
+    loop.next_due_ts = loop.scheduled_at
+    loop.max_cycles = 1
+    _svc(monkeypatch, _FakeSvc([loop]))
+    updated = _loop("scheduled")
+    updated.scheduled_at = float(int(time.time()) + 1200)
+    authorize = AsyncMock(return_value=(updated, None, 200))
+    monkeypatch.setattr(h, "authorize_and_update_nudge", authorize)
+
+    response = await h.api_autonudge_update(
+        _mk(
+            "PATCH",
+            "/api/autonudge/scheduled",
+            match={"loop_id": "scheduled"},
+            body={"message": "changed", "at": updated.scheduled_at},
+        )
+    )
+
+    assert response.status == 200
+    assert authorize.await_args.kwargs["message"] == "changed"
+    assert authorize.await_args.kwargs["scheduled_at"] == updated.scheduled_at
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_an_already_fired_scheduled_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _loop("scheduled")
+    loop.scheduled_at = time.time() + 600
+    loop.cycle_count = 1
+    _svc(monkeypatch, _FakeSvc([loop]))
+    authorize = AsyncMock()
+    monkeypatch.setattr(h, "authorize_and_update_nudge", authorize)
+
+    response = await h.api_autonudge_update(
+        _mk(
+            "PATCH",
+            "/api/autonudge/scheduled",
+            match={"loop_id": "scheduled"},
+            body={"message": "changed"},
+        )
+    )
+
+    assert response.status == 409
+    assert _body(response)["code"] == "scheduled_message_in_flight"
+    authorize.assert_not_awaited()
 
 
 @pytest.mark.asyncio

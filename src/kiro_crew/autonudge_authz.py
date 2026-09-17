@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import time
 import uuid
 from copy import deepcopy
 from pathlib import Path
@@ -30,6 +32,7 @@ from typing import Any, Callable, Protocol, runtime_checkable
 from kiro_crew import autonudge_provider_trust
 from kiro_crew.autonudge import (
     MAX_BANNER_CHARS,
+    MAX_SCHEDULE_AHEAD_SECS,
     MonitorUpdateConflict,
     NudgeAdmissionRefused,
     is_channel_key,
@@ -530,6 +533,7 @@ async def authorize_and_update_nudge(
     active: Any = None,
     max_runtime_secs: Any = None,
     banner: Any = None,
+    scheduled_at: Any = None,
     source: str,
     caller: str = "",
 ) -> tuple[Any | None, str | None, int]:
@@ -587,6 +591,18 @@ async def authorize_and_update_nudge(
             return _deny("message too long (max 8000 chars)", 400)
         message, _ = redact_exfiltration_urls(message)
         message, _ = redact_credentials(message)
+    if scheduled_at is not None:
+        if isinstance(scheduled_at, bool):
+            return _deny("scheduled_at must be a finite epoch-seconds number", 400)
+        try:
+            scheduled_at = float(scheduled_at)
+        except (TypeError, ValueError, OverflowError):
+            return _deny("scheduled_at must be a finite epoch-seconds number", 400)
+        now = time.time()
+        if not math.isfinite(scheduled_at) or scheduled_at <= now:
+            return _deny("scheduled_at must be in the future", 400)
+        if scheduled_at > now + MAX_SCHEDULE_AHEAD_SECS:
+            return _deny("scheduled_at must be within 30 days", 400)
     if banner is not None:
         # Optional and display-only; ``None`` reached here means "leave
         # unchanged" and was filtered by the caller, so a value present now is a
@@ -659,6 +675,7 @@ async def authorize_and_update_nudge(
                         ("max_runtime_secs", max_runtime_secs),
                         ("active", active),
                         ("banner", banner),
+                        ("scheduled_at", scheduled_at),
                     )
                     if v is not None
                 ),
@@ -680,7 +697,10 @@ async def authorize_and_update_nudge(
             active=active,
             max_runtime_secs=max_runtime_secs,
             banner=banner,
+            scheduled_at=scheduled_at,
         )
+    except ValueError as exc:
+        return _deny(str(exc), 409)
     except Exception as exc:  # noqa: BLE001 - audit the failure, then propagate
         _audit("error", f"svc.update failed: {type(exc).__name__}")
         raise
@@ -701,6 +721,7 @@ async def authorize_and_add_nudge(
     stop_sentinel_path: str = "",
     max_runtime_secs: int = 0,
     banner: str = "",
+    scheduled_at: float = 0.0,
     source: str,
     caller: str = "",
     # UNGATED by default: this chokepoint is shared with callers whose work is not
@@ -766,19 +787,26 @@ async def authorize_and_add_nudge(
 
     def _audit(outcome: str, err: str | None = None) -> None:
         try:
+            metadata = {
+                "slot_key": slot_key,
+                "idle_secs": idle_secs,
+                "max_cycles": max_cycles,
+                "max_runtime_secs": max_runtime_secs,
+                "caller": caller,
+            }
+            if (
+                isinstance(scheduled_at, (int, float))
+                and not isinstance(scheduled_at, bool)
+                and scheduled_at > 0
+            ):
+                metadata["scheduled_at"] = scheduled_at
             sel().log_tool_invocation(
                 session_key=slot_key,
                 source=source,
                 tool_name=audit_tool,
                 outcome=outcome,
                 error=err or "",
-                metadata={
-                    "slot_key": slot_key,
-                    "idle_secs": idle_secs,
-                    "max_cycles": max_cycles,
-                    "max_runtime_secs": max_runtime_secs,
-                    "caller": caller,
-                },
+                metadata=metadata,
             )
         except Exception:  # noqa: BLE001 - auditing must never break the flow
             logger.warning("autonudge audit failed", exc_info=True)
@@ -786,6 +814,17 @@ async def authorize_and_add_nudge(
     def _deny(reason: str, status: int) -> tuple[None, str, int]:
         _audit("denied", reason)
         return None, reason, status
+
+    if isinstance(scheduled_at, bool):
+        return _deny("scheduled_at must be a finite epoch-seconds number", 400)
+    try:
+        scheduled_at = float(scheduled_at)
+    except (TypeError, ValueError, OverflowError):
+        return _deny("scheduled_at must be a finite epoch-seconds number", 400)
+    if not math.isfinite(scheduled_at) or scheduled_at < 0:
+        return _deny("scheduled_at must be a finite epoch-seconds number", 400)
+    if scheduled_at > 0 and monitor is not None:
+        return _deny("scheduled messages cannot be structured monitors", 400)
 
     if svc is None:
         _audit("error", "autonudge disabled")
@@ -826,6 +865,11 @@ async def authorize_and_add_nudge(
     if banner_channel_error:
         return _deny(banner_channel_error, 400)
     admission_check: Callable[[], bool]
+    # The first surface is the dashboard composer. Keeping scheduled messages on
+    # dashboard slots avoids silently inventing DM semantics for transport keys;
+    # channel scheduling can be added once its authorizing UX exists.
+    if scheduled_at > 0 and is_channel_key(slot_key):
+        return _deny("scheduled messages currently require a dashboard session", 400)
     # Set only on the dashboard branch, when a crew/member slot is armed by its
     # own turn; channel-bound loops have no slot mode and stay False.
     self_armed = False
@@ -1153,9 +1197,11 @@ async def authorize_and_add_nudge(
                 "max_runtime_secs": int(max_runtime_secs),
                 "banner": banner,
                 "admission_check": admission_check,
-                "gate": gate,
+                "gate": False if scheduled_at > 0 else gate,
                 "creation_surface": creation_surface,
             }
+            if scheduled_at > 0:
+                add_kwargs["scheduled_at"] = scheduled_at
             if not replace_existing:
                 add_kwargs["replace_existing"] = False
             if replace_stopped:
